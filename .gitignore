@@ -1,0 +1,11 @@
+# Derleme çıktıları ve geçici klasörler
+obj/
+kms
+kms_test
+
+# Log ve geçici metin dosyaları
+*.txt
+
+# Sistem dosyaları ve bağlama noktaları
+mnt/
+.DS_Store
