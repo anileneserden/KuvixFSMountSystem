@@ -127,9 +127,72 @@ static int kms_fuse_unlink(const char* path) {
     return -ENOENT;
 }
 
+static int kms_fuse_read(const char* path, char* buf, size_t size, off_t offset,
+                         struct fuse_file_info* fi) {
+    (void) fi;
+    
+    // 1. Dosyayı meta tabloda ara
+    for (int i = 0; i < KVX_MAX_FILES; i++) {
+        if (g_meta.ent[i].used && std::strcmp(g_meta.ent[i].path, path) == 0) {
+            if (offset >= g_meta.ent[i].size) return 0;
+            if (offset + size > g_meta.ent[i].size) {
+                size = g_meta.ent[i].size - offset;
+            }
+
+            // 2. İmaj dosyasından veriyi oku
+            FILE* f = fopen(g_img_path.c_str(), "rb");
+            if (!f) return -EIO;
+
+            // LBA konumunu hesapla (Her LBA 512 byte) + offset
+            uint64_t file_pos = (uint64_t)g_meta.ent[i].start_lba * 512 + offset;
+            fseek(f, file_pos, SEEK_SET);
+            size_t bytes_read = fread(buf, 1, size, f);
+            fclose(f);
+
+            return bytes_read;
+        }
+    }
+    return -ENOENT;
+}
+
+static int kms_fuse_write(const char* path, const char* buf, size_t size, off_t offset,
+                          struct fuse_file_info* fi) {
+    (void) fi;
+
+    for (int i = 0; i < KVX_MAX_FILES; i++) {
+        if (g_meta.ent[i].used && std::strcmp(g_meta.ent[i].path, path) == 0) {
+            FILE* f = fopen(g_img_path.c_str(), "r+b");
+            if (!f) return -EIO;
+
+            // LBA konumu + yazma offseti
+            uint64_t file_pos = (uint64_t)g_meta.ent[i].start_lba * 512 + offset;
+            fseek(f, file_pos, SEEK_SET);
+            size_t bytes_written = fwrite(buf, 1, size, f);
+            fclose(f);
+
+            // Eğer dosya boyutu büyüdüyse meta veriyi güncelle
+            if (offset + bytes_written > g_meta.ent[i].size) {
+                g_meta.ent[i].size = offset + bytes_written;
+                
+                // Basit bir sonraki boş LBA yönetimi (Fragmentasyonu şimdilik boş veriyoruz)
+                uint32_t sectors_used = (g_meta.ent[i].size + 511) / 512;
+                if (g_meta.ent[i].start_lba + sectors_used > g_meta.next_free_lba) {
+                    g_meta.next_free_lba = g_meta.ent[i].start_lba + sectors_used;
+                }
+                save_meta();
+            }
+
+            return bytes_written;
+        }
+    }
+    return -ENOENT;
+}
+
 static const struct fuse_operations kms_oper = {
     .getattr = kms_fuse_getattr,
     .unlink  = kms_fuse_unlink,
+    .read    = kms_fuse_read,
+    .write   = kms_fuse_write,
     .readdir = kms_fuse_readdir,
     .create  = kms_fuse_create,
 };
