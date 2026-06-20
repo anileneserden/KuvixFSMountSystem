@@ -138,9 +138,63 @@ static int kms_fuse_truncate(const char* path, off_t size, struct fuse_file_info
 
 static int kms_fuse_unlink(const char* path) {
     for (int i = 0; i < KVX_MAX_FILES; i++) {
+        // Dosya bulunduysa ve kullanımdaysa
         if (g_meta.ent[i].used && std::strcmp(g_meta.ent[i].path, path) == 0) {
+            
+            // 1. İmaj dosyasındaki kapladığı alanı (sektörleri) temizleyelim (sıfırlayalım)
+            FILE* f = fopen(g_img_path.c_str(), "r+b");
+            if (f) {
+                uint64_t file_pos = (uint64_t)g_meta.ent[i].start_lba * 512;
+                uint32_t sectors_used = (g_meta.ent[i].size + 511) / 512;
+                
+                fseek(f, file_pos, SEEK_SET);
+                char zero_buf[512] = {0};
+                for (uint32_t s = 0; s < sectors_used; s++) {
+                    fwrite(zero_buf, 1, 512, f);
+                }
+                fclose(f);
+            }
+
+            // 2. Meta tablodaki girdiyi ve genel dosya sayacını güncelle
             g_meta.ent[i].used = 0;
-            g_meta.file_count--;
+            g_meta.ent[i].size = 0;
+            g_meta.ent[i].start_lba = 0;
+            std::memset(g_meta.ent[i].path, 0, sizeof(g_meta.ent[i].path));
+            
+            // 🔹 Kritik Düzeltme: Toplam dosya sayacını azaltıyoruz
+            if (g_meta.file_count > 0) {
+                g_meta.file_count--;
+            }
+
+            // 3. Değişiklikleri diske (meta alana) kaydet
+            save_meta();
+            return 0;
+        }
+    }
+    return -ENOENT;
+}
+
+static int kms_fuse_rmdir(const char* path) {
+    for (int i = 0; i < KVX_MAX_FILES; i++) {
+        // Klasör bulunduysa ve kullanımdaysa
+        if (g_meta.ent[i].used && std::strcmp(g_meta.ent[i].path, path) == 0) {
+            
+            // Güvenlik Kontrolü: Eğer bu bir dosya ise rmdir ile silinmesin
+            if (g_meta.ent[i].size != KVX_DIR_SIZE) {
+                return -ENOTDIR;
+            }
+
+            // Meta tablodaki girdiyi ve genel dosya sayacını güncelle
+            g_meta.ent[i].used = 0;
+            g_meta.ent[i].size = 0;
+            g_meta.ent[i].start_lba = 0;
+            std::memset(g_meta.ent[i].path, 0, sizeof(g_meta.ent[i].path));
+            
+            if (g_meta.file_count > 0) {
+                g_meta.file_count--;
+            }
+
+            // Değişiklikleri diske kaydet
             save_meta();
             return 0;
         }
@@ -263,16 +317,16 @@ static int kms_fuse_write(const char* path, const char* buf, size_t size, off_t 
     return -ENOENT;
 }
 
-// 🔹 Sıralama hatasını kökten çözen C++ uyumlu atama yöntemi
 static const struct fuse_operations kms_oper = []{
     struct fuse_operations op;
     std::memset(&op, 0, sizeof(op));
     
     op.getattr  = kms_fuse_getattr;
     op.mkdir    = kms_fuse_mkdir;
+    op.rmdir    = kms_fuse_rmdir;
     op.unlink   = kms_fuse_unlink;
     op.rename   = kms_fuse_rename;
-    op.truncate = kms_fuse_truncate; // 🔹 Yeni eklendi!
+    op.truncate = kms_fuse_truncate; 
     op.readdir  = kms_fuse_readdir;
     op.create   = kms_fuse_create;
     op.read     = kms_fuse_read;
