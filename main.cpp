@@ -47,6 +47,8 @@ void save_meta() {
     if (!f) return;
     fseek(f, 2048 * 512, SEEK_SET);
     fwrite(&g_meta, sizeof(kvx_meta_t), 1, f);
+    fflush(f); // Önbelleği zorla diske boşalt
+    fsync(fileno(f)); // İşletim sistemi seviyesinde diske işle
     fclose(f);
 }
 
@@ -299,6 +301,10 @@ static int kms_fuse_write(const char* path, const char* buf, size_t size, off_t 
             uint64_t file_pos = (uint64_t)g_meta.ent[i].start_lba * 512 + (uint64_t)offset;
             fseek(f, file_pos, SEEK_SET);
             size_t bytes_written = fwrite(buf, 1, size, f);
+            
+            fflush(f);
+            fsync(fileno(f));
+            
             fclose(f);
 
             if ((uint32_t)offset + bytes_written > g_meta.ent[i].size) {
@@ -317,6 +323,13 @@ static int kms_fuse_write(const char* path, const char* buf, size_t size, off_t 
     return -ENOENT;
 }
 
+static int kms_fuse_utimens(const char* path, const struct timespec tv[2], struct fuse_file_info* fi) {
+    (void) path;
+    (void) tv;
+    (void) fi;
+    return 0;
+}
+
 static const struct fuse_operations kms_oper = []{
     struct fuse_operations op;
     std::memset(&op, 0, sizeof(op));
@@ -331,7 +344,8 @@ static const struct fuse_operations kms_oper = []{
     op.create   = kms_fuse_create;
     op.read     = kms_fuse_read;
     op.write    = kms_fuse_write;
-    
+    op.utimens  = kms_fuse_utimens;
+
     return op;
 }();
 
