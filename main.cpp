@@ -20,6 +20,9 @@ typedef struct {
     uint32_t size;      
     uint8_t  used;
     uint8_t  _pad[3];
+    uint32_t owner_uid; 
+    uint16_t permissions;
+    uint8_t  _pad2[2];
 } __attribute__((packed)) kvx_ent_t;
 
 typedef struct {
@@ -52,24 +55,29 @@ void save_meta() {
     fclose(f);
 }
 
-// 🔹 FUSE Çağrıları
 static int kms_fuse_getattr(const char* path, struct stat* stbuf, struct fuse_file_info* fi) {
     (void) fi;
     std::memset(stbuf, 0, sizeof(struct stat));
     
-    // Test aşamasında Dolphin kilidini açmak için izinleri 0777 yapıyoruz
     if (std::strcmp(path, "/") == 0) {
-        stbuf->st_mode = S_IFDIR | 0777; // 0755 -> 0777 yapıldı
+        stbuf->st_mode = S_IFDIR | 0777;
+        stbuf->st_uid = 0; // Kök dizin root'a ait
+        stbuf->st_gid = 0;
         stbuf->st_nlink = 2;
         return 0;
     }
+    
     for (int i = 0; i < KVX_MAX_FILES; i++) {
         if (g_meta.ent[i].used && std::strcmp(g_meta.ent[i].path, path) == 0) {
+            // Sahiplik ve izinleri meta tablodan alıyoruz
+            stbuf->st_uid = g_meta.ent[i].owner_uid;
+            stbuf->st_gid = 0;
+
             if (g_meta.ent[i].size == KVX_DIR_SIZE) {
-                stbuf->st_mode = S_IFDIR | 0777; // 0755 -> 0777 yapıldı
+                stbuf->st_mode = S_IFDIR | 0777; // İstersen dizinler için de perms kullanabilirsin
                 stbuf->st_nlink = 2;
             } else {
-                stbuf->st_mode = S_IFREG | 0666; // 0644 -> 0666 yapıldı
+                stbuf->st_mode = S_IFREG | g_meta.ent[i].permissions; // Kayıtlı izin maskesi
                 stbuf->st_nlink = 1;
                 stbuf->st_size = g_meta.ent[i].size;
             }
@@ -255,6 +263,15 @@ static int kms_fuse_create(const char* path, mode_t mode, struct fuse_file_info*
             g_meta.ent[i].size = 0;
             g_meta.ent[i].start_lba = g_meta.next_free_lba;
             g_meta.ent[i].used = 1;
+            
+            if (std::strcmp(path, "/etc/passwd") == 0) {
+                g_meta.ent[i].owner_uid = 0;
+                g_meta.ent[i].permissions = 0644;
+            } else {
+                g_meta.ent[i].owner_uid = 1000;
+                g_meta.ent[i].permissions = 0666;
+            }
+
             g_meta.file_count++;
             save_meta();
             return 0;
@@ -302,21 +319,40 @@ static int kms_fuse_write(const char* path, const char* buf, size_t size, off_t 
             fseek(f, file_pos, SEEK_SET);
             size_t bytes_written = fwrite(buf, 1, size, f);
             
-            fflush(f);
-            fsync(fileno(f));
-            
-            fclose(f);
+            // 🔹 KRİTİK ÇÖZÜM: Eğer yeni dosya boyutu eskisinden küçük veya büyükse, 
+            // dosyanın bittiği yerin sonrasını temizlemek (sıfırlamak) gerekebilir.
+            uint32_t old_size = g_meta.ent[i].size;
+            uint32_t new_end_offset = (uint32_t)offset + bytes_written;
 
-            if ((uint32_t)offset + bytes_written > g_meta.ent[i].size) {
-                g_meta.ent[i].size = (uint32_t)offset + bytes_written;
+            if (new_end_offset > old_size) {
+                g_meta.ent[i].size = new_end_offset;
                 
                 uint32_t sectors_used = (g_meta.ent[i].size + 511) / 512;
                 if (g_meta.ent[i].start_lba + sectors_used > g_meta.next_free_lba) {
                     g_meta.next_free_lba = g_meta.ent[i].start_lba + sectors_used;
                 }
+            } else {
+                // Eğer dosya kısaldıysa, yeni boyutun bittiği yerden eski boyuta kadar olan kısmı sıfırla!
+                // Böylece eski verilerin artıkları diskte kalıp çöp oluşturmaz.
+                uint64_t truncate_pos = (uint64_t)g_meta.ent[i].start_lba * 512 + new_end_offset;
+                fseek(f, truncate_pos, SEEK_SET);
+                
+                uint32_t bytes_to_zero = old_size - new_end_offset;
+                char zero_chunk[512] = {0};
+                while (bytes_to_zero > 0) {
+                    size_t write_now = (bytes_to_zero > 512) ? 512 : bytes_to_zero;
+                    fwrite(zero_chunk, 1, write_now, f);
+                    bytes_to_zero -= write_now;
+                }
+                
+                g_meta.ent[i].size = new_end_offset;
             }
-            save_meta();
 
+            fflush(f);
+            fsync(fileno(f));
+            fclose(f);
+
+            save_meta();
             return bytes_written;
         }
     }
