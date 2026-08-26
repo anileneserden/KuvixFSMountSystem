@@ -19,10 +19,8 @@ typedef struct {
     uint32_t start_lba;
     uint32_t size;      
     uint8_t  used;
-    uint8_t  _pad[3];
-    uint32_t owner_uid; 
     uint16_t permissions;
-    uint8_t  _pad2[2];
+    uint8_t  owner_uid;
 } __attribute__((packed)) kvx_ent_t;
 
 typedef struct {
