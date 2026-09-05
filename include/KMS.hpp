@@ -5,6 +5,7 @@
 
 // KuvixOS içerisindeki desteklenen dosya sistemi türleri
 enum class FileSystemType {
+    KryonFS,
     KuvixFS,
     FAT12,
     FAT16,

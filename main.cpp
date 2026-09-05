@@ -10,6 +10,16 @@
 #include <cstdlib> // system() fonksiyonu için
 #include "include/KMS.hpp"
 
+// 🔹 Hangi dosya sisteminin aktif olduğunu anlamak için enum ekliyoruz
+enum class ActiveFS {
+    Unknown,
+    KuvixFS,
+    KryonFS
+};
+
+ActiveFS g_active_fs = ActiveFS::Unknown;
+
+// --- KUVIXFS YAPILARI ---
 #define KVX_MAGIC     "KVXFS1"
 #define KVX_MAX_FILES 256
 #define KVX_DIR_SIZE  0xFFFFFFFFu
@@ -30,26 +40,88 @@ typedef struct {
     kvx_ent_t ent[KVX_MAX_FILES];
 } __attribute__((packed)) kvx_meta_t;
 
+kvx_meta_t g_kvx_meta;
+
+// --- KRYFS YAPILARI ---
+#define KRYFS_MAGIC       0x4B525953 // "KRYS"
+#define KRYFS_BLOCK_SIZE  512
+#define KRYFS_MAX_INODES  16
+
+typedef struct {
+    uint32_t magic;
+    uint32_t total_sectors;
+    uint32_t inode_count;
+    uint32_t block_size;
+    char     volume_name[32];
+} __attribute__((packed)) kryfs_superblock_t;
+
+typedef struct {
+    uint32_t inode_id;
+    char     filename[32];
+    uint32_t size;
+    uint32_t first_block;
+    uint8_t  is_used;
+} __attribute__((packed)) kryfs_inode_t;
+
+kryfs_superblock_t g_kry_sb;
+kryfs_inode_t      g_kry_inodes[KRYFS_MAX_INODES];
+
 KuvixFSMountSystem kms;
 std::string g_img_path = "";
-kvx_meta_t g_meta;
 
+// 🔹 load_meta() fonksiyonunu iki formatı da kontrol edecek şekilde güncelliyoruz
 bool load_meta() {
     FILE* f = fopen(g_img_path.c_str(), "rb");
     if (!f) return false;
+
+    // 1. Önce KRYFS kontrolü yapalım (Byte 0)
+    kryfs_superblock_t temp_kry_sb;
+    fseek(f, 0, SEEK_SET);
+    if (fread(&temp_kry_sb, sizeof(kryfs_superblock_t), 1, f) == 1) {
+        std::cout << "[DEBUG] Okunan KRYFS Magic (Hex): 0x" << std::hex << temp_kry_sb.magic << std::dec << " (Beklenen: 0x" << std::hex << KRYFS_MAGIC << std::dec << ")" << std::endl;
+        if (temp_kry_sb.magic == KRYFS_MAGIC) {
+            g_kry_sb = temp_kry_sb;
+            fseek(f, KRYFS_BLOCK_SIZE, SEEK_SET);
+            fread(g_kry_inodes, sizeof(kryfs_inode_t), KRYFS_MAX_INODES, f);
+            fclose(f);
+            g_active_fs = ActiveFS::KryonFS;
+            return true;
+        }
+    }
+
+    // 2. KRYFS değilse KuvixFS kontrolü yapalım
     fseek(f, 2048 * 512, SEEK_SET);
-    fread(&g_meta, sizeof(kvx_meta_t), 1, f);
+    if (fread(&g_kvx_meta, sizeof(kvx_meta_t), 1, f) == 1) {
+        std::cout << "[DEBUG] Okunan KuvixFS Magic: " << std::string(g_kvx_meta.magic, 6) << std::endl;
+        if (std::strncmp(g_kvx_meta.magic, KVX_MAGIC, 6) == 0) {
+            fclose(f);
+            g_active_fs = ActiveFS::KuvixFS;
+            return true;
+        }
+    }
+
     fclose(f);
-    return (std::strncmp(g_meta.magic, KVX_MAGIC, 6) == 0);
+    return false;
 }
 
+// 🔹 save_meta() fonksiyonunu aktif dosya sistemine göre yönlendiriyoruz
 void save_meta() {
     FILE* f = fopen(g_img_path.c_str(), "r+b");
     if (!f) return;
-    fseek(f, 2048 * 512, SEEK_SET);
-    fwrite(&g_meta, sizeof(kvx_meta_t), 1, f);
-    fflush(f); // Önbelleği zorla diske boşalt
-    fsync(fileno(f)); // İşletim sistemi seviyesinde diske işle
+
+    if (g_active_fs == ActiveFS::KryonFS) {
+        fseek(f, 0, SEEK_SET);
+        fwrite(&g_kry_sb, sizeof(kryfs_superblock_t), 1, f);
+        fseek(f, KRYFS_BLOCK_SIZE, SEEK_SET);
+        fwrite(g_kry_inodes, sizeof(kryfs_inode_t), KRYFS_MAX_INODES, f);
+    } 
+    else if (g_active_fs == ActiveFS::KuvixFS) {
+        fseek(f, 2048 * 512, SEEK_SET);
+        fwrite(&g_kvx_meta, sizeof(kvx_meta_t), 1, f);
+    }
+
+    fflush(f); 
+    fsync(fileno(f)); 
     fclose(f);
 }
 
@@ -59,41 +131,61 @@ static int kms_fuse_getattr(const char* path, struct stat* stbuf, struct fuse_fi
     
     if (std::strcmp(path, "/") == 0) {
         stbuf->st_mode = S_IFDIR | 0777;
-        stbuf->st_uid = 0; // Kök dizin root'a ait
+        stbuf->st_uid = 0; 
         stbuf->st_gid = 0;
         stbuf->st_nlink = 2;
         return 0;
     }
     
-    for (int i = 0; i < KVX_MAX_FILES; i++) {
-        if (g_meta.ent[i].used && std::strcmp(g_meta.ent[i].path, path) == 0) {
-            // Sahiplik ve izinleri meta tablodan alıyoruz
-            stbuf->st_uid = g_meta.ent[i].owner_uid;
-            stbuf->st_gid = 0;
-
-            if (g_meta.ent[i].size == KVX_DIR_SIZE) {
-                stbuf->st_mode = S_IFDIR | 0777; // İstersen dizinler için de perms kullanabilirsin
-                stbuf->st_nlink = 2;
-            } else {
-                stbuf->st_mode = S_IFREG | g_meta.ent[i].permissions; // Kayıtlı izin maskesi
+    // 🔹 KRYFS İÇİN GETATTR
+    if (g_active_fs == ActiveFS::KryonFS) {
+        const char* fname = path + 1;
+        for (int i = 0; i < KRYFS_MAX_INODES; i++) {
+            if (g_kry_inodes[i].is_used && std::strcmp(g_kry_inodes[i].filename, fname) == 0) {
+                stbuf->st_uid = getuid();
+                stbuf->st_gid = getgid();
+                stbuf->st_mode = S_IFREG | 0644;
                 stbuf->st_nlink = 1;
-                stbuf->st_size = g_meta.ent[i].size;
+                stbuf->st_size = g_kry_inodes[i].size;
+                return 0;
             }
-            return 0;
+        }
+        return -ENOENT;
+    }
+
+    // 🔹 KUVIXFS İÇİN GETATTR (Mevcut kodun)
+    if (g_active_fs == ActiveFS::KuvixFS) {
+        for (int i = 0; i < KVX_MAX_FILES; i++) {
+            if (g_kvx_meta.ent[i].used && std::strcmp(g_kvx_meta.ent[i].path, path) == 0) {
+                stbuf->st_uid = g_kvx_meta.ent[i].owner_uid;
+                stbuf->st_gid = 0;
+
+                if (g_kvx_meta.ent[i].size == KVX_DIR_SIZE) {
+                    stbuf->st_mode = S_IFDIR | 0777;
+                    stbuf->st_nlink = 2;
+                } else {
+                    stbuf->st_mode = S_IFREG | g_kvx_meta.ent[i].permissions;
+                    stbuf->st_nlink = 1;
+                    stbuf->st_size = g_kvx_meta.ent[i].size;
+                }
+                return 0;
+            }
         }
     }
     return -ENOENT;
 }
 
 static int kms_fuse_mkdir(const char* path, mode_t mode) {
+    if (g_active_fs == ActiveFS::KryonFS) return -ENOTSUP; // KRYFS düz yapıda olduğu için klasör desteklemiyor olabilir
+
     (void) mode;
     for (int i = 0; i < KVX_MAX_FILES; i++) {
-        if (!g_meta.ent[i].used) {
-            std::strncpy(g_meta.ent[i].path, path, 63);
-            g_meta.ent[i].size = KVX_DIR_SIZE; // KuvixFS mantığında bu bir klasördür
-            g_meta.ent[i].start_lba = 0;       // Klasörlerin LBA'sı olmaz
-            g_meta.ent[i].used = 1;
-            g_meta.file_count++;
+        if (!g_kvx_meta.ent[i].used) {
+            std::strncpy(g_kvx_meta.ent[i].path, path, 63);
+            g_kvx_meta.ent[i].size = KVX_DIR_SIZE;
+            g_kvx_meta.ent[i].start_lba = 0;
+            g_kvx_meta.ent[i].used = 1;
+            g_kvx_meta.file_count++;
             save_meta();
             return 0;
         }
@@ -102,14 +194,12 @@ static int kms_fuse_mkdir(const char* path, mode_t mode) {
 }
 
 static int kms_fuse_rename(const char* from, const char* to, unsigned int flags) {
-    // FUSE 3 standartlarında flags gelebilir, RENAME_NOREPLACE gibi durumlar için.
-    // Şimdilik basitçe ezici adlandırma yapıyoruz.
+    if (g_active_fs == ActiveFS::KryonFS) return -ENOTSUP;
     (void) flags;
 
     for (int i = 0; i < KVX_MAX_FILES; i++) {
-        if (g_meta.ent[i].used && std::strcmp(g_meta.ent[i].path, from) == 0) {
-            // Sadece meta tablodaki dosya yolunu (path) yenisiyle güncelliyoruz
-            std::strncpy(g_meta.ent[i].path, to, 63);
+        if (g_kvx_meta.ent[i].used && std::strcmp(g_kvx_meta.ent[i].path, from) == 0) {
+            std::strncpy(g_kvx_meta.ent[i].path, to, 63);
             save_meta();
             return 0;
         }
@@ -120,23 +210,31 @@ static int kms_fuse_rename(const char* from, const char* to, unsigned int flags)
 static int kms_fuse_truncate(const char* path, off_t size, struct fuse_file_info* fi) {
     (void) fi;
 
+    if (g_active_fs == ActiveFS::KryonFS) {
+        const char* fname = path + 1;
+        for (int i = 0; i < KRYFS_MAX_INODES; i++) {
+            if (g_kry_inodes[i].is_used && std::strcmp(g_kry_inodes[i].filename, fname) == 0) {
+                g_kry_inodes[i].size = (uint32_t)size;
+                save_meta();
+                return 0;
+            }
+        }
+        return -ENOENT;
+    }
+
     for (int i = 0; i < KVX_MAX_FILES; i++) {
-        if (g_meta.ent[i].used && std::strcmp(g_meta.ent[i].path, path) == 0) {
-            g_meta.ent[i].size = (uint32_t)size; // Dosya boyutunu Linux'un istediği boyuta (örn: 0) çekiyoruz
-            
-            // Eğer dosya tamamen sıfırlandıysa, imaj dosyasındaki ilgili alanı da temizleyebiliriz
+        if (g_kvx_meta.ent[i].used && std::strcmp(g_kvx_meta.ent[i].path, path) == 0) {
+            g_kvx_meta.ent[i].size = (uint32_t)size;
             if (size == 0) {
                 FILE* f = fopen(g_img_path.c_str(), "r+b");
                 if (f) {
-                    uint64_t file_pos = (uint64_t)g_meta.ent[i].start_lba * 512;
+                    uint64_t file_pos = (uint64_t)g_kvx_meta.ent[i].start_lba * 512;
                     fseek(f, file_pos, SEEK_SET);
-                    // İlk sektörü sıfırla
                     char zero_buf[512] = {0};
                     fwrite(zero_buf, 1, 512, f);
                     fclose(f);
                 }
             }
-            
             save_meta();
             return 0;
         }
@@ -145,16 +243,26 @@ static int kms_fuse_truncate(const char* path, off_t size, struct fuse_file_info
 }
 
 static int kms_fuse_unlink(const char* path) {
+    if (g_active_fs == ActiveFS::KryonFS) {
+        const char* fname = path + 1;
+        for (int i = 0; i < KRYFS_MAX_INODES; i++) {
+            if (g_kry_inodes[i].is_used && std::strcmp(g_kry_inodes[i].filename, fname) == 0) {
+                g_kry_inodes[i].is_used = 0;
+                g_kry_inodes[i].size = 0;
+                std::memset(g_kry_inodes[i].filename, 0, sizeof(g_kry_inodes[i].filename));
+                save_meta();
+                return 0;
+            }
+        }
+        return -ENOENT;
+    }
+
     for (int i = 0; i < KVX_MAX_FILES; i++) {
-        // Dosya bulunduysa ve kullanımdaysa
-        if (g_meta.ent[i].used && std::strcmp(g_meta.ent[i].path, path) == 0) {
-            
-            // 1. İmaj dosyasındaki kapladığı alanı (sektörleri) temizleyelim (sıfırlayalım)
+        if (g_kvx_meta.ent[i].used && std::strcmp(g_kvx_meta.ent[i].path, path) == 0) {
             FILE* f = fopen(g_img_path.c_str(), "r+b");
             if (f) {
-                uint64_t file_pos = (uint64_t)g_meta.ent[i].start_lba * 512;
-                uint32_t sectors_used = (g_meta.ent[i].size + 511) / 512;
-                
+                uint64_t file_pos = (uint64_t)g_kvx_meta.ent[i].start_lba * 512;
+                uint32_t sectors_used = (g_kvx_meta.ent[i].size + 511) / 512;
                 fseek(f, file_pos, SEEK_SET);
                 char zero_buf[512] = {0};
                 for (uint32_t s = 0; s < sectors_used; s++) {
@@ -163,18 +271,15 @@ static int kms_fuse_unlink(const char* path) {
                 fclose(f);
             }
 
-            // 2. Meta tablodaki girdiyi ve genel dosya sayacını güncelle
-            g_meta.ent[i].used = 0;
-            g_meta.ent[i].size = 0;
-            g_meta.ent[i].start_lba = 0;
-            std::memset(g_meta.ent[i].path, 0, sizeof(g_meta.ent[i].path));
+            g_kvx_meta.ent[i].used = 0;
+            g_kvx_meta.ent[i].size = 0;
+            g_kvx_meta.ent[i].start_lba = 0;
+            std::memset(g_kvx_meta.ent[i].path, 0, sizeof(g_kvx_meta.ent[i].path));
             
-            // 🔹 Kritik Düzeltme: Toplam dosya sayacını azaltıyoruz
-            if (g_meta.file_count > 0) {
-                g_meta.file_count--;
+            if (g_kvx_meta.file_count > 0) {
+                g_kvx_meta.file_count--;
             }
 
-            // 3. Değişiklikleri diske (meta alana) kaydet
             save_meta();
             return 0;
         }
@@ -183,26 +288,23 @@ static int kms_fuse_unlink(const char* path) {
 }
 
 static int kms_fuse_rmdir(const char* path) {
+    if (g_active_fs == ActiveFS::KryonFS) return -ENOTSUP;
+
     for (int i = 0; i < KVX_MAX_FILES; i++) {
-        // Klasör bulunduysa ve kullanımdaysa
-        if (g_meta.ent[i].used && std::strcmp(g_meta.ent[i].path, path) == 0) {
-            
-            // Güvenlik Kontrolü: Eğer bu bir dosya ise rmdir ile silinmesin
-            if (g_meta.ent[i].size != KVX_DIR_SIZE) {
+        if (g_kvx_meta.ent[i].used && std::strcmp(g_kvx_meta.ent[i].path, path) == 0) {
+            if (g_kvx_meta.ent[i].size != KVX_DIR_SIZE) {
                 return -ENOTDIR;
             }
 
-            // Meta tablodaki girdiyi ve genel dosya sayacını güncelle
-            g_meta.ent[i].used = 0;
-            g_meta.ent[i].size = 0;
-            g_meta.ent[i].start_lba = 0;
-            std::memset(g_meta.ent[i].path, 0, sizeof(g_meta.ent[i].path));
+            g_kvx_meta.ent[i].used = 0;
+            g_kvx_meta.ent[i].size = 0;
+            g_kvx_meta.ent[i].start_lba = 0;
+            std::memset(g_kvx_meta.ent[i].path, 0, sizeof(g_kvx_meta.ent[i].path));
             
-            if (g_meta.file_count > 0) {
-                g_meta.file_count--;
+            if (g_kvx_meta.file_count > 0) {
+                g_kvx_meta.file_count--;
             }
 
-            // Değişiklikleri diske kaydet
             save_meta();
             return 0;
         }
@@ -214,36 +316,40 @@ static int kms_fuse_readdir(const char* path, void* buf, fuse_fill_dir_t filler,
                             off_t offset, struct fuse_file_info* fi, enum fuse_readdir_flags flags) {
     (void) offset; (void) fi; (void) flags;
     
-    // Güvenlik Kontrolü
     MountPoint* mp = kms.ResolvePath(path);
     if (!mp) return -ENOENT;
 
-    // Her dizinde bulunması gereken standart noktalar
     filler(buf, ".", NULL, 0, (fuse_fill_dir_flags)0);
     filler(buf, "..", NULL, 0, (fuse_fill_dir_flags)0);
 
+    // 🔹 KRYFS İÇİN READDDIR
+    if (g_active_fs == ActiveFS::KryonFS) {
+        if (std::strcmp(path, "/") != 0) return -ENOENT;
+        for (int i = 0; i < KRYFS_MAX_INODES; i++) {
+            if (g_kry_inodes[i].is_used) {
+                filler(buf, g_kry_inodes[i].filename, NULL, 0, (fuse_fill_dir_flags)0);
+            }
+        }
+        return 0;
+    }
+
+    // 🔹 KUVIXFS İÇİN READDDIR (Mevcut kodun)
     std::string current_dir(path);
     if (current_dir.back() != '/') {
         current_dir += "/";
     }
 
     for (int i = 0; i < KVX_MAX_FILES; i++) {
-        if (g_meta.ent[i].used) {
-            std::string file_path(g_meta.ent[i].path);
+        if (g_kvx_meta.ent[i].used) {
+            std::string file_path(g_kvx_meta.ent[i].path);
             
-            // Eğer aranan şey kök dizin ("/") ise ve dosya kök dizindeyse doğrudan ismi al
             if (current_dir == "/" && file_path != "/" && file_path.find('/', 1) == std::string::npos) {
-                // Başındaki '/' işaretini atlayarak ekle
                 filler(buf, file_path.c_str() + 1, NULL, 0, (fuse_fill_dir_flags)0);
                 continue;
             }
 
-            // Alt dizinler için kontrol: Dosya yolu, aradığımız dizinle mi başlıyor?
             if (file_path.rfind(current_dir, 0) == 0 && file_path != current_dir) {
-                // Üst dizin kısmını kırpıp sadece dosya/klasör adını alıyoruz
                 std::string sub_name = file_path.substr(current_dir.length());
-                
-                // Eğer içinde başka '/' yoksa, bu tam olarak bu dizinin altındaki elemandır
                 if (sub_name.find('/') == std::string::npos && !sub_name.empty()) {
                     filler(buf, sub_name.c_str(), NULL, 0, (fuse_fill_dir_flags)0);
                 }
@@ -255,22 +361,47 @@ static int kms_fuse_readdir(const char* path, void* buf, fuse_fill_dir_t filler,
 
 static int kms_fuse_create(const char* path, mode_t mode, struct fuse_file_info* fi) {
     (void) mode; (void) fi;
+
+    if (g_active_fs == ActiveFS::KryonFS) {
+        const char* fname = path + 1;
+        // Dosya adı çok uzunsa engelle
+        if (std::strlen(fname) >= 32) return -ENAMETOOLONG;
+
+        for (int i = 0; i < KRYFS_MAX_INODES; i++) {
+            if (!g_kry_inodes[i].is_used) {
+                g_kry_inodes[i].inode_id = i + 1;
+                std::strncpy(g_kry_inodes[i].filename, fname, 31);
+                g_kry_inodes[i].filename[31] = '\0';
+                g_kry_inodes[i].size = 0;
+                // Her inode için 512 baytlık blok ayıralım (Superblock = Blok 0, Inode tablosu = Blok 1 vb.)
+                // İtibar güvenliği için her dosyaya distinct bir başlangıç bloğu verelim:
+                g_kry_inodes[i].first_block = 10 + (i * 4); 
+                g_kry_inodes[i].is_used = 1;
+                
+                save_meta();
+                std::cout << "[+] KRYFS Dosya Oluşturuldu: " << fname << " (Blok: " << g_kry_inodes[i].first_block << ")" << std::endl;
+                return 0;
+            }
+        }
+        return -ENOSPC;
+    }
+
     for (int i = 0; i < KVX_MAX_FILES; i++) {
-        if (!g_meta.ent[i].used) {
-            std::strncpy(g_meta.ent[i].path, path, 63);
-            g_meta.ent[i].size = 0;
-            g_meta.ent[i].start_lba = g_meta.next_free_lba;
-            g_meta.ent[i].used = 1;
+        if (!g_kvx_meta.ent[i].used) {
+            std::strncpy(g_kvx_meta.ent[i].path, path, 63);
+            g_kvx_meta.ent[i].size = 0;
+            g_kvx_meta.ent[i].start_lba = g_kvx_meta.next_free_lba;
+            g_kvx_meta.ent[i].used = 1;
             
             if (std::strcmp(path, "/etc/passwd") == 0) {
-                g_meta.ent[i].owner_uid = 0;
-                g_meta.ent[i].permissions = 0644;
+                g_kvx_meta.ent[i].owner_uid = 0;
+                g_kvx_meta.ent[i].permissions = 0644;
             } else {
-                g_meta.ent[i].owner_uid = 1000;
-                g_meta.ent[i].permissions = 0666;
+                g_kvx_meta.ent[i].owner_uid = 1000;
+                g_kvx_meta.ent[i].permissions = 0666;
             }
 
-            g_meta.file_count++;
+            g_kvx_meta.file_count++;
             save_meta();
             return 0;
         }
@@ -282,18 +413,39 @@ static int kms_fuse_read(const char* path, char* buf, size_t size, off_t offset,
                          struct fuse_file_info* fi) {
     (void) fi;
     
+    if (g_active_fs == ActiveFS::KryonFS) {
+        const char* fname = path + 1;
+        for (int i = 0; i < KRYFS_MAX_INODES; i++) {
+            if (g_kry_inodes[i].is_used && std::strcmp(g_kry_inodes[i].filename, fname) == 0) {
+                if ((uint32_t)offset >= g_kry_inodes[i].size) return 0;
+                if ((uint32_t)offset + size > g_kry_inodes[i].size) {
+                    size = g_kry_inodes[i].size - (uint32_t)offset;
+                }
+
+                FILE* f = fopen(g_img_path.c_str(), "rb");
+                if (!f) return -EIO;
+
+                uint64_t file_pos = (uint64_t)g_kry_inodes[i].first_block * KRYFS_BLOCK_SIZE + (uint64_t)offset;
+                fseek(f, file_pos, SEEK_SET);
+                size_t bytes_read = fread(buf, 1, size, f);
+                fclose(f);
+                return bytes_read;
+            }
+        }
+        return -ENOENT;
+    }
+
     for (int i = 0; i < KVX_MAX_FILES; i++) {
-        if (g_meta.ent[i].used && std::strcmp(g_meta.ent[i].path, path) == 0) {
-            // off_t türünü güvenle karşılaştırmak için uint64_t veya dosya boyutu tipine döküyoruz
-            if ((uint32_t)offset >= g_meta.ent[i].size) return 0;
-            if ((uint32_t)offset + size > g_meta.ent[i].size) {
-                size = g_meta.ent[i].size - (uint32_t)offset;
+        if (g_kvx_meta.ent[i].used && std::strcmp(g_kvx_meta.ent[i].path, path) == 0) {
+            if ((uint32_t)offset >= g_kvx_meta.ent[i].size) return 0;
+            if ((uint32_t)offset + size > g_kvx_meta.ent[i].size) {
+                size = g_kvx_meta.ent[i].size - (uint32_t)offset;
             }
 
             FILE* f = fopen(g_img_path.c_str(), "rb");
             if (!f) return -EIO;
 
-            uint64_t file_pos = (uint64_t)g_meta.ent[i].start_lba * 512 + (uint64_t)offset;
+            uint64_t file_pos = (uint64_t)g_kvx_meta.ent[i].start_lba * 512 + (uint64_t)offset;
             fseek(f, file_pos, SEEK_SET);
             size_t bytes_read = fread(buf, 1, size, f);
             fclose(f);
@@ -308,33 +460,57 @@ static int kms_fuse_write(const char* path, const char* buf, size_t size, off_t 
                           struct fuse_file_info* fi) {
     (void) fi;
 
+    if (g_active_fs == ActiveFS::KryonFS) {
+        const char* fname = path + 1;
+        for (int i = 0; i < KRYFS_MAX_INODES; i++) {
+            if (g_kry_inodes[i].is_used && std::strcmp(g_kry_inodes[i].filename, fname) == 0) {
+                FILE* f = fopen(g_img_path.c_str(), "r+b");
+                if (!f) return -EIO;
+
+                uint64_t file_pos = (uint64_t)g_kry_inodes[i].first_block * KRYFS_BLOCK_SIZE + (uint64_t)offset;
+                fseek(f, file_pos, SEEK_SET);
+                size_t bytes_written = fwrite(buf, 1, size, f);
+                
+                uint32_t new_end_offset = (uint32_t)offset + bytes_written;
+                if (new_end_offset > g_kry_inodes[i].size) {
+                    g_kry_inodes[i].size = new_end_offset;
+                }
+
+                fflush(f);
+                fsync(fileno(f));
+                fclose(f);
+
+                // 🔹 KRİTİK: Inode boyutundaki değişimi diske kalıcı olarak kaydet!
+                save_meta();
+                
+                std::cout << "[+] KRYFS Yazıldı: " << bytes_written << " bayt (" << path << ")" << std::endl;
+                return bytes_written;
+            }
+        }
+        return -ENOENT;
+    }
+
     for (int i = 0; i < KVX_MAX_FILES; i++) {
-        if (g_meta.ent[i].used && std::strcmp(g_meta.ent[i].path, path) == 0) {
+        if (g_kvx_meta.ent[i].used && std::strcmp(g_kvx_meta.ent[i].path, path) == 0) {
             FILE* f = fopen(g_img_path.c_str(), "r+b");
             if (!f) return -EIO;
 
-            uint64_t file_pos = (uint64_t)g_meta.ent[i].start_lba * 512 + (uint64_t)offset;
+            uint64_t file_pos = (uint64_t)g_kvx_meta.ent[i].start_lba * 512 + (uint64_t)offset;
             fseek(f, file_pos, SEEK_SET);
             size_t bytes_written = fwrite(buf, 1, size, f);
             
-            // 🔹 KRİTİK ÇÖZÜM: Eğer yeni dosya boyutu eskisinden küçük veya büyükse, 
-            // dosyanın bittiği yerin sonrasını temizlemek (sıfırlamak) gerekebilir.
-            uint32_t old_size = g_meta.ent[i].size;
+            uint32_t old_size = g_kvx_meta.ent[i].size;
             uint32_t new_end_offset = (uint32_t)offset + bytes_written;
 
             if (new_end_offset > old_size) {
-                g_meta.ent[i].size = new_end_offset;
-                
-                uint32_t sectors_used = (g_meta.ent[i].size + 511) / 512;
-                if (g_meta.ent[i].start_lba + sectors_used > g_meta.next_free_lba) {
-                    g_meta.next_free_lba = g_meta.ent[i].start_lba + sectors_used;
+                g_kvx_meta.ent[i].size = new_end_offset;
+                uint32_t sectors_used = (g_kvx_meta.ent[i].size + 511) / 512;
+                if (g_kvx_meta.ent[i].start_lba + sectors_used > g_kvx_meta.next_free_lba) {
+                    g_kvx_meta.next_free_lba = g_kvx_meta.ent[i].start_lba + sectors_used;
                 }
             } else {
-                // Eğer dosya kısaldıysa, yeni boyutun bittiği yerden eski boyuta kadar olan kısmı sıfırla!
-                // Böylece eski verilerin artıkları diskte kalıp çöp oluşturmaz.
-                uint64_t truncate_pos = (uint64_t)g_meta.ent[i].start_lba * 512 + new_end_offset;
+                uint64_t truncate_pos = (uint64_t)g_kvx_meta.ent[i].start_lba * 512 + new_end_offset;
                 fseek(f, truncate_pos, SEEK_SET);
-                
                 uint32_t bytes_to_zero = old_size - new_end_offset;
                 char zero_chunk[512] = {0};
                 while (bytes_to_zero > 0) {
@@ -342,14 +518,12 @@ static int kms_fuse_write(const char* path, const char* buf, size_t size, off_t 
                     fwrite(zero_chunk, 1, write_now, f);
                     bytes_to_zero -= write_now;
                 }
-                
-                g_meta.ent[i].size = new_end_offset;
+                g_kvx_meta.ent[i].size = new_end_offset;
             }
 
             fflush(f);
             fsync(fileno(f));
             fclose(f);
-
             save_meta();
             return bytes_written;
         }
@@ -358,16 +532,13 @@ static int kms_fuse_write(const char* path, const char* buf, size_t size, off_t 
 }
 
 static int kms_fuse_utimens(const char* path, const struct timespec tv[2], struct fuse_file_info* fi) {
-    (void) path;
-    (void) tv;
-    (void) fi;
+    (void) path; (void) tv; (void) fi;
     return 0;
 }
 
 static const struct fuse_operations kms_oper = []{
     struct fuse_operations op;
     std::memset(&op, 0, sizeof(op));
-    
     op.getattr  = kms_fuse_getattr;
     op.mkdir    = kms_fuse_mkdir;
     op.rmdir    = kms_fuse_rmdir;
@@ -379,7 +550,6 @@ static const struct fuse_operations kms_oper = []{
     op.read     = kms_fuse_read;
     op.write    = kms_fuse_write;
     op.utimens  = kms_fuse_utimens;
-
     return op;
 }();
 
@@ -393,7 +563,6 @@ int main(int argc, char* argv[]) {
 
     std::string mode = argv[1];
 
-    // 🔹 UNMOUNT MODU (-u)
     if (mode == "-u") {
         std::string target_dir = argv[2];
         std::string cmd = "fusermount3 -u " + target_dir;
@@ -407,7 +576,6 @@ int main(int argc, char* argv[]) {
         return res;
     }
 
-    // 🔹 MOUNT MODU (-m)
     if (mode == "-m" && argc >= 4) {
         g_img_path = argv[2];
         char* mount_dir = argv[3];
@@ -417,19 +585,29 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        kms.Mount("/", 0, FileSystemType::KuvixFS);
+        // Hangi dosya sistemi aktifse KMS'e ona göre bildiriyoruz
+        if (g_active_fs == ActiveFS::KryonFS) {
+            kms.Mount("/", 0, FileSystemType::KuvixFS); // Varsa KRYFS türünü ekleyebilirsin, yoksa şimdilik idare eder
+            std::cout << "[*] Aktif Dosya Sistemi: KRYFS" << std::endl;
+        } else {
+            kms.Mount("/", 0, FileSystemType::KuvixFS);
+            std::cout << "[*] Aktif Dosya Sistemi: KuvixFS" << std::endl;
+        }
+
         std::cout << "[+] " << g_img_path << " imajı " << mount_dir << " konumuna bağlanıyor..." << std::endl;
 
-        // FUSE için argüman dizisini genişletiyoruz (İzin çakışmalarını çözmek adına)
-        // allow_other,default_permissions eklenerek Dolphin/Sudo kilitleri çözüldü.
         char* fuse_argv[] = { 
             argv[0], 
             mount_dir, 
             (char*)"-o", 
-            (char*)"allow_other" // default_permissions kelimesini kaldırdık
+            (char*)"allow_other"
         };
         
-        return fuse_main(4, fuse_argv, &kms_oper, NULL);
+        int fuse_res = fuse_main(4, fuse_argv, &kms_oper, NULL);
+        if (fuse_res != 0) {
+            std::cerr << "[-] FUSE Hata Kodu: " << fuse_res << std::endl;
+        }
+        return fuse_res;
     }
 
     return 1;
