@@ -137,17 +137,42 @@ static int kms_fuse_getattr(const char* path, struct stat* stbuf, struct fuse_fi
         return 0;
     }
     
-    // 🔹 KRYFS İÇİN GETATTR
     if (g_active_fs == ActiveFS::KryonFS) {
         const char* fname = path + 1;
+        
+        // Kök dizin kontrolü
+        if (std::strcmp(path, "/") == 0) {
+            stbuf->st_mode = S_IFDIR | 0777;
+            stbuf->st_uid = getuid();
+            stbuf->st_gid = getgid();
+            stbuf->st_nlink = 2;
+            return 0;
+        }
+
         for (int i = 0; i < KRYFS_MAX_INODES; i++) {
-            if (g_kry_inodes[i].is_used && std::strcmp(g_kry_inodes[i].filename, fname) == 0) {
-                stbuf->st_uid = getuid();
-                stbuf->st_gid = getgid();
-                stbuf->st_mode = S_IFREG | 0644;
-                stbuf->st_nlink = 1;
-                stbuf->st_size = g_kry_inodes[i].size;
-                return 0;
+            if (g_kry_inodes[i].is_used) {
+                // Eşleşme kontrolü (klasörler için sonundaki '/' dikkate alınabilir)
+                std::string stored_name = g_kry_inodes[i].filename;
+                std::string target_name = fname;
+                if (stored_name.back() == '/' && target_name.back() != '/') {
+                    target_name += '/';
+                }
+
+                if (stored_name == target_name) {
+                    stbuf->st_uid = getuid();
+                    stbuf->st_gid = getgid();
+                    stbuf->st_nlink = 1;
+
+                    // Eğer sonu '/' ile bitiyorsa klasördür
+                    if (stored_name.back() == '/') {
+                        stbuf->st_mode = S_IFDIR | 0777;
+                        stbuf->st_size = 0;
+                    } else {
+                        stbuf->st_mode = S_IFREG | 0644;
+                        stbuf->st_size = g_kry_inodes[i].size;
+                    }
+                    return 0;
+                }
             }
         }
         return -ENOENT;
@@ -176,9 +201,37 @@ static int kms_fuse_getattr(const char* path, struct stat* stbuf, struct fuse_fi
 }
 
 static int kms_fuse_mkdir(const char* path, mode_t mode) {
-    if (g_active_fs == ActiveFS::KryonFS) return -ENOTSUP; // KRYFS düz yapıda olduğu için klasör desteklemiyor olabilir
-
     (void) mode;
+
+    if (g_active_fs == ActiveFS::KryonFS) {
+        const char* dname = path + 1; // Başındaki '/' işaretini kaldır
+        if (std::strlen(dname) >= 31) return -ENAMETOOLONG;
+
+        for (int i = 0; i < KRYFS_MAX_INODES; i++) {
+            if (!g_kry_inodes[i].is_used) {
+                g_kry_inodes[i].inode_id = i + 1;
+                std::strncpy(g_kry_inodes[i].filename, dname, 31);
+                
+                // Klasör adının sonunun '/' ile bitmesini garanti et
+                int len = std::strlen(g_kry_inodes[i].filename);
+                if (len > 0 && g_kry_inodes[i].filename[len - 1] != '/' && len < 31) {
+                    g_kry_inodes[i].filename[len] = '/';
+                    g_kry_inodes[i].filename[len + 1] = '\0';
+                }
+
+                g_kry_inodes[i].size = 0;
+                g_kry_inodes[i].first_block = 0;
+                g_kry_inodes[i].is_used = 1;
+                
+                save_meta();
+                std::cout << "[+] KRYFS Klasör Oluşturuldu: " << g_kry_inodes[i].filename << std::endl;
+                return 0;
+            }
+        }
+        return -ENOSPC;
+    }
+
+    // KuvixFS için mevcut kod...
     for (int i = 0; i < KVX_MAX_FILES; i++) {
         if (!g_kvx_meta.ent[i].used) {
             std::strncpy(g_kvx_meta.ent[i].path, path, 63);
@@ -288,8 +341,53 @@ static int kms_fuse_unlink(const char* path) {
 }
 
 static int kms_fuse_rmdir(const char* path) {
-    if (g_active_fs == ActiveFS::KryonFS) return -ENOTSUP;
+    if (g_active_fs == ActiveFS::KryonFS) {
+        // Gelen path'in başındaki '/' işaretini atıp, KRYFS formatına uygun olması için sonuna '/' ekliyoruz
+        std::string target_path = path + 1;
+        if (!target_path.empty() && target_path.back() != '/') {
+            target_path += '/';
+        }
 
+        int target_index = -1;
+
+        // 1. Silinecek dizini bul (ismin sonu '/' ile bitiyorsa klasördür)
+        for (int i = 0; i < KRYFS_MAX_INODES; i++) {
+            if (g_kry_inodes[i].is_used) {
+                std::string stored_name = g_kry_inodes[i].filename;
+                if (!stored_name.empty() && stored_name.back() == '/' && stored_name == target_path) {
+                    target_index = i;
+                    break;
+                }
+            }
+        }
+
+        if (target_index == -1) {
+            return -ENOENT; // Klasör bulunamadı
+        }
+
+        // 2. Klasörün içi boş mu kontrol et (Bu dizin prefix'i ile başlayan başka kayıt var mı?)
+        std::string prefix = target_path;
+        for (int i = 0; i < KRYFS_MAX_INODES; i++) {
+            if (g_kry_inodes[i].is_used && i != target_index) {
+                std::string current_file = g_kry_inodes[i].filename;
+                if (current_file.rfind(prefix, 0) == 0) {
+                    return -ENOTEMPTY; // Klasör boş değil!
+                }
+            }
+        }
+
+        // 3. Inode'u sıfırla ve kaydet
+        g_kry_inodes[target_index].is_used = 0;
+        g_kry_inodes[target_index].size = 0;
+        g_kry_inodes[target_index].first_block = 0;
+        std::memset(g_kry_inodes[target_index].filename, 0, sizeof(g_kry_inodes[target_index].filename));
+
+        save_meta();
+        std::cout << "[+] KRYFS Dizin Silindi: " << target_path << std::endl;
+        return 0;
+    }
+
+    // KuvixFS için mevcut kod...
     for (int i = 0; i < KVX_MAX_FILES; i++) {
         if (g_kvx_meta.ent[i].used && std::strcmp(g_kvx_meta.ent[i].path, path) == 0) {
             if (g_kvx_meta.ent[i].size != KVX_DIR_SIZE) {
@@ -324,10 +422,35 @@ static int kms_fuse_readdir(const char* path, void* buf, fuse_fill_dir_t filler,
 
     // 🔹 KRYFS İÇİN READDDIR
     if (g_active_fs == ActiveFS::KryonFS) {
-        if (std::strcmp(path, "/") != 0) return -ENOENT;
+        std::string current_dir(path);
+        // Eğer kök dizin değilse ve sonu '/' ile bitmiyorsa '/' ekleyelim
+        if (current_dir != "/" && current_dir.back() != '/') {
+            current_dir += "/";
+        }
+
         for (int i = 0; i < KRYFS_MAX_INODES; i++) {
             if (g_kry_inodes[i].is_used) {
-                filler(buf, g_kry_inodes[i].filename, NULL, 0, (fuse_fill_dir_flags)0);
+                // Disk üzerindeki inode yolu (örn: "Users/anil/" veya "deneme/")
+                std::string file_path = "/" + std::string(g_kry_inodes[i].filename);
+
+                // Eğer dosya/klasör bu dizinin içindeyse (başı current_dir ile eşleşiyorsa)
+                if (file_path.rfind(current_dir, 0) == 0 && file_path != current_dir) {
+                    std::string sub_name = file_path.substr(current_dir.length());
+                    
+                    // Sadece bu dizinin altındakileri listele (iç içe klasörlerin tamamını basma)
+                    size_t slash_pos = sub_name.find('/');
+                    if (slash_pos == std::string::npos || slash_pos == sub_name.length() - 1) {
+                        
+                        // FUSE 'filler' isimlerin sonunda veya içinde '/' KABUL ETMEZ!
+                        if (slash_pos == sub_name.length() - 1) {
+                            sub_name.pop_back(); // FUSE'a verirken sondaki '/' işaretini kaldırıyoruz
+                        }
+                        
+                        if (!sub_name.empty()) {
+                            filler(buf, sub_name.c_str(), NULL, 0, (fuse_fill_dir_flags)0);
+                        }
+                    }
+                }
             }
         }
         return 0;
@@ -364,7 +487,6 @@ static int kms_fuse_create(const char* path, mode_t mode, struct fuse_file_info*
 
     if (g_active_fs == ActiveFS::KryonFS) {
         const char* fname = path + 1;
-        // Dosya adı çok uzunsa engelle
         if (std::strlen(fname) >= 32) return -ENAMETOOLONG;
 
         for (int i = 0; i < KRYFS_MAX_INODES; i++) {
@@ -373,9 +495,10 @@ static int kms_fuse_create(const char* path, mode_t mode, struct fuse_file_info*
                 std::strncpy(g_kry_inodes[i].filename, fname, 31);
                 g_kry_inodes[i].filename[31] = '\0';
                 g_kry_inodes[i].size = 0;
-                // Her inode için 512 baytlık blok ayıralım (Superblock = Blok 0, Inode tablosu = Blok 1 vb.)
-                // İtibar güvenliği için her dosyaya distinct bir başlangıç bloğu verelim:
-                g_kry_inodes[i].first_block = 10 + (i * 4); 
+                
+                // 🔹 DÜZELTME: Kernel tarafı ilk dosyayı (index 0) 2. bloktan başlatır. 
+                // Rastgele 10 + ... vermek yerine kernelin format mantığına uyumlu yapıyoruz:
+                g_kry_inodes[i].first_block = 2 + i; 
                 g_kry_inodes[i].is_used = 1;
                 
                 save_meta();
